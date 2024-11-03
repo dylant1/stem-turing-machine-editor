@@ -2,7 +2,6 @@
     import { onMount, onDestroy, tick } from 'svelte';
     import cytoscape from 'cytoscape';
     import cytoscapeCoseBilkent from 'cytoscape-cose-bilkent';
-    import edgehandles from 'cytoscape-edgehandles';
     import undoRedo from 'cytoscape-undo-redo';
   
     let cy;
@@ -13,9 +12,38 @@
     let addTransitionMode = false;
     let transitionSourceNode = null;
   
-    // Register the layout extension and edgehandles
+    let showTransitionModal = false;
+    let transitionLabel = '';
+    let transitionCallback = null;
+  
+    let showEdgeLabelModal = false;
+    let edgeToEdit = null;
+    let edgeLabel = '';
+  
+    // Global counter for node IDs
+    let stateIdCounter = 0;
+  
+    // Variable to store last mouse position
+    let lastMousePosition = { x: 0, y: 0 };
+  
+    // Variables for context menu
+    let contextMenuVisible = false;
+    let contextMenuPosition = { x: 0, y: 0 };
+    let contextNode = null;
+    let contextEdge = null;
+    let contextMenuType = ''; // 'node', 'edge'
+  
+    // Tape simulation variables (if applicable)
+    let tape = [];
+    let tapeHeadPosition = 0;
+    let currentState = null;
+    let isAcceptState = false;
+    let isRunning = false;
+    let simulationInterval = null;
+    let transitionMap = {};
+  
+    // Register the layout extension and undo-redo
     cytoscape.use(cytoscapeCoseBilkent);
-    cytoscape.use(edgehandles);
     cytoscape.use(undoRedo);
   
     function handleFileUpload(event) {
@@ -36,6 +64,8 @@
       // Initialize arrays to store parsed states and transitions
       const tmStates = [];
       const tmTransitions = [];
+      let tapeLines = [];
+      tapeHeadPosition = 0;
   
       // Split the definition into lines and parse
       const lines = tmDefinition.split('\n');
@@ -57,19 +87,25 @@
           continue;
         } else if (line.startsWith('Start Triangle Position:')) {
           currentSection = null;
+          // Extract the tapeHeadPosition
+          const tokens = line.split(':');
+          tapeHeadPosition = parseInt(tokens[1].trim());
           continue;
         }
   
         if (currentSection === 'STATES') {
           // Parse state line
           const tokens = line.split(/\s+/);
-          const [id, x, y, start, accept] = tokens;
+          const [id, x, y, start, accept, r, g, b, a] = tokens;
+          // Convert RGBA values to CSS color string
+          const color = `rgba(${parseFloat(r) * 255}, ${parseFloat(g) * 255}, ${parseFloat(b) * 255}, ${parseFloat(a)})`;
           tmStates.push({
             id: id,
             x: parseFloat(x),
             y: parseFloat(y),
             start: start === 'true',
             accept: accept === 'true',
+            color: color,
           });
         } else if (currentSection === 'TRANSITION') {
           // Parse transition line
@@ -82,6 +118,12 @@
             writeChar: writeChar,
             moveDirection: moveDirection,
           });
+        } else if (currentSection === 'TAPE') {
+          if (!line.startsWith('Start Triangle Position:') && !line.startsWith('//') && line !== '') {
+            if (isNaN(parseInt(line))) {
+              tapeLines.push(line);
+            }
+          }
         }
       }
   
@@ -95,6 +137,7 @@
             label: state.id,
             start: state.start,
             accept: state.accept,
+            color: state.color, // Include the color data
           },
           position: { x: state.x, y: state.y },
         });
@@ -106,13 +149,44 @@
             id: `e${transition.from}-${transition.to}-${Math.random()}`,
             source: transition.from,
             target: transition.to,
-            label: `${transition.readChar}→${transition.writeChar}, ${transition.moveDirection}`,
+            label: `${transition.readChar}->${transition.writeChar}, ${transition.moveDirection}`,
           },
         });
       });
   
       // Initialize Cytoscape
       initializeCytoscape(elements);
+  
+      // Initialize the tape
+      tape = tapeLines.join('').split('');
+      // Find the start state
+      const startStates = tmStates.filter((state) => state.start);
+      if (startStates.length > 0) {
+        currentState = startStates[0].id;
+      } else {
+        // If no start state, use the first state
+        currentState = tmStates[0].id;
+      }
+      isAcceptState = false;
+  
+      // Build the transition map
+      transitionMap = {};
+  
+      tmTransitions.forEach((transition) => {
+        const fromState = transition.from;
+        const readChar = transition.readChar;
+        if (!transitionMap[fromState]) {
+          transitionMap[fromState] = {};
+        }
+        if (readChar === '~') {
+          transitionMap[fromState]['~'] = transition;
+        } else {
+          transitionMap[fromState][readChar] = transition;
+        }
+      });
+  
+      // Update visualization
+      updateVisualization();
     }
   
     function initializeCytoscape(elements) {
@@ -127,7 +201,7 @@
           {
             selector: 'node',
             style: {
-              'background-color': '#fafad2', // Default background color
+              'background-color': 'data(color)', // Use color from data
               'label': 'data(label)',
               'text-valign': 'center',
               'color': '#000',
@@ -168,9 +242,17 @@
             },
           },
           {
+            selector: 'node.current',
+            style: {
+              'border-color': 'red',
+              'border-width': 3,
+            },
+          },
+          {
             selector: 'node:selected',
             style: {
-              'overlay-opacity': 0,
+              'overlay-opacity': 0.2, // Set to a visible opacity
+              'overlay-color': '#dfeffc', // Optional: Set overlay color
               'border-width': 3,
               'border-color': 'blue',
             },
@@ -178,7 +260,8 @@
           {
             selector: 'edge:selected',
             style: {
-              'overlay-opacity': 0,
+              'overlay-opacity': 0.2,
+              'overlay-color': '#dfeffc',
               'line-color': 'blue',
               'target-arrow-color': 'blue',
             },
@@ -189,10 +272,48 @@
         },
         selectionType: 'single', // Enable single selection
         boxSelectionEnabled: true, // Enable box selection
+        autounselectify: false, // Ensure selection is enabled
       });
+  
+      // Enable user interactions
+      cy.userZoomingEnabled(true);
+      cy.userPanningEnabled(true);
   
       // Initialize undo-redo extension
       ur = cy.undoRedo();
+  
+      // Register 'changeData' action
+      ur.action(
+        'changeData',
+        function (args) {
+          const ele = args.ele;
+          const data = args.data;
+          const oldData = {};
+  
+          for (let key in data) {
+            oldData[key] = ele.data(key);
+            ele.data(key, data[key]);
+          }
+  
+          return { ele: ele, data: oldData };
+        },
+        function (args) {
+          const ele = args.ele;
+          const data = args.data;
+  
+          for (let key in data) {
+            ele.data(key, data[key]);
+          }
+        }
+      );
+  
+      // Set stateIdCounter to the maximum numeric node ID plus one
+      const numericIds = cy.nodes().map((node) => parseInt(node.id())).filter((id) => !isNaN(id));
+      if (numericIds.length > 0) {
+        stateIdCounter = Math.max(...numericIds) + 1;
+      } else {
+        stateIdCounter = 0;
+      }
   
       // Apply classes for start and accept states
       cy.nodes().forEach((node) => {
@@ -203,10 +324,6 @@
           node.addClass('accept');
         }
       });
-  
-      // Enable pan and zoom
-      cy.userZoomingEnabled(true);
-      cy.userPanningEnabled(true);
   
       // Handle events
       cy.on('tap', (event) => {
@@ -236,35 +353,25 @@
       // Handle keydown events for duplicate, delete, undo, redo, and save function
       document.addEventListener('keydown', handleKeyDown);
   
+      // Event listener to check if nodes are selectable
+      cy.on('select', 'node', (event) => {
+        console.log('Node selected:', event.target.id());
+      });
+  
       // Clean up event listeners when the component is destroyed
       onDestroy(() => {
         document.removeEventListener('keydown', handleKeyDown);
       });
-  
-      // Enable edge creation (we'll handle this manually)
     }
   
     function addNodeAtPosition(x, y) {
-      const newId = getNextAvailableStateId();
+      const newId = getNextAvailableStateId().toString();
       cy.add({
         group: 'nodes',
-        data: { id: newId.toString(), label: newId.toString() },
+        data: { id: newId, label: newId, color: '#fafad2' },
         position: { x, y },
       });
     }
-  
-    function editEdgeLabel(edge) {
-      const newLabel = prompt('Enter new label', edge.data('label'));
-      if (newLabel !== null) {
-        edge.data('label', newLabel);
-      }
-    }
-  
-    let contextMenuVisible = false;
-    let contextMenuPosition = { x: 0, y: 0 };
-    let contextNode = null;
-    let contextEdge = null;
-    let contextMenuType = ''; // 'node', 'edge'
   
     function openNodeContextMenu(node, event) {
       event.preventDefault();
@@ -310,108 +417,141 @@
     }
   
     function setNodeColor() {
-      const color = prompt('Enter color (e.g., #FF0000)');
+      const color = prompt('Enter color (e.g., #FF0000 or rgba(255,0,0,1))');
       if (color) {
-        ur.do('changeStyle', {
-          ele: contextNode,
-          style: { 'background-color': color },
+        let nodesToChange = cy.nodes(':selected');
+        if (nodesToChange.length === 0 && contextNode) {
+          nodesToChange = cy.collection([contextNode]);
+        }
+        nodesToChange.forEach((node) => {
+          ur.do('changeData', {
+            ele: node,
+            data: { color: color },
+          });
         });
       }
       closeContextMenu();
     }
   
-    function editTransition() {
-      const newLabel = prompt('Enter new transition label', contextEdge.data('label'));
-      if (newLabel !== null) {
+    function editEdgeLabel(edge) {
+      edgeToEdit = edge;
+      edgeLabel = edge.data('label');
+      showEdgeLabelModal = true;
+      closeContextMenu();
+    }
+  
+    function saveEdgeLabel() {
+      if (edgeToEdit && edgeLabel !== null) {
         ur.do('changeData', {
-          ele: contextEdge,
-          data: { label: newLabel },
+          ele: edgeToEdit,
+          data: { label: edgeLabel },
         });
       }
-      closeContextMenu();
+      showEdgeLabelModal = false;
+      edgeToEdit = null;
+      edgeLabel = '';
     }
   
-    // Function to get the next available state ID (smallest integer not in use)
+    function cancelEdgeLabelEdit() {
+      showEdgeLabelModal = false;
+      edgeToEdit = null;
+      edgeLabel = '';
+    }
+  
+    // Function to get the next available state ID (unique and numeric)
     function getNextAvailableStateId() {
-      const existingIds = cy.nodes().map((node) => parseInt(node.id())).filter((id) => !isNaN(id));
-      let id = 0;
-      while (existingIds.includes(id)) {
-        id++;
+      while (cy.getElementById(stateIdCounter.toString()).length > 0) {
+        stateIdCounter++;
       }
-      return id;
+      return stateIdCounter++;
     }
   
     // Handle keydown events for duplicate, delete, undo, redo, and save function
     function handleKeyDown(event) {
       if (event.metaKey || event.ctrlKey) {
-        if (event.key === 'd') {
+        const key = event.key.toLowerCase();
+        console.log(`Key pressed with Ctrl/Cmd: ${key}`);
+        if (key === 'd') {
           event.preventDefault();
+          console.log('Duplicate command detected');
           duplicateSelection();
-        } else if (event.key === 'z') {
+        } else if (key === 'z') {
           event.preventDefault();
           if (event.shiftKey) {
             ur.redo();
+            console.log('Redo action performed');
           } else {
             ur.undo();
+            console.log('Undo action performed');
           }
-        } else if (event.key === 'f') {
+        } else if (key === 'f') {
           event.preventDefault();
+          console.log('Save function command detected');
           saveSelectionAsFunction();
         }
       } else if (event.key === 'Delete' || event.key === 'Backspace') {
         deleteSelection();
+        console.log('Delete action performed');
       }
     }
   
     function duplicateSelection() {
       const selectedNodes = cy.nodes(':selected');
+  
+      console.log(`Selected nodes for duplication: ${selectedNodes.map((n) => n.id()).join(', ')}`);
       if (selectedNodes.length === 0) {
+        console.log('No nodes selected to duplicate');
         return;
       }
   
       const selectedEdges = cy.edges().filter((edge) => {
         return selectedNodes.contains(edge.source()) && selectedNodes.contains(edge.target());
       });
+      console.log('Selected edges for duplication:', selectedEdges.map((e) => e.id()));
   
       // Mapping of old IDs to new IDs
       const idMap = {};
   
-      // Duplicate nodes
-      ur.do('batch', () => {
-        selectedNodes.forEach((node) => {
-          const data = { ...node.data() };
-          const newId = getNextAvailableStateId();
-          idMap[node.id()] = newId.toString();
-          data.id = newId.toString();
-          data.label = newId.toString();
-          const newNode = cy.add({
-            group: 'nodes',
-            data: data,
-            position: {
-              x: node.position('x'),
-              y: node.position('y') + 50, // Place below the original
-            },
-          });
-          if (node.hasClass('start')) {
-            newNode.addClass('start');
-          }
-          if (node.hasClass('accept')) {
-            newNode.addClass('accept');
-          }
-        });
+      const elementsToAdd = [];
   
-        // Duplicate edges
-        selectedEdges.forEach((edge) => {
-          const data = { ...edge.data() };
-          data.id = `e${idMap[data.source] || data.source}-${idMap[data.target] || data.target}-${Math.random()}`;
-          data.source = idMap[data.source] || data.source;
-          data.target = idMap[data.target] || data.target;
-          cy.add({
-            group: 'edges',
-            data: data,
-          });
-        });
+      selectedNodes.forEach((node) => {
+        const data = { ...node.data() };
+        const newId = getNextAvailableStateId().toString();
+        idMap[node.id()] = newId;
+        data.id = newId;
+        data.label = newId;
+        // Preserve 'start', 'accept', and 'color' properties
+        data.start = node.data('start');
+        data.accept = node.data('accept');
+        data.color = node.data('color'); // Preserve color
+        const position = {
+          x: node.position('x') + 50,
+          y: node.position('y') + 50, // Place diagonally below the original
+        };
+        const newNode = {
+          group: 'nodes',
+          data: data,
+          position: position,
+        };
+        elementsToAdd.push(newNode);
+        console.log(`Duplicated node ${node.id()} as ${newId}`);
       });
+  
+      selectedEdges.forEach((edge) => {
+        const data = { ...edge.data() };
+        data.source = idMap[data.source] || data.source;
+        data.target = idMap[data.target] || data.target;
+        data.id = `e${data.source}-${data.target}-${Math.random()}`;
+        const newEdge = {
+          group: 'edges',
+          data: data,
+        };
+        elementsToAdd.push(newEdge);
+        console.log(`Duplicated edge from ${data.source} to ${data.target}`);
+      });
+  
+      // Add all elements using ur.do('add', elementsToAdd)
+      ur.do('add', elementsToAdd);
   
       // Deselect all elements
       cy.elements().unselect();
@@ -420,19 +560,25 @@
       const newNodes = cy.nodes().filter((node) => {
         return Object.values(idMap).includes(node.id());
       });
+  
       newNodes.select();
+      console.log(`New nodes selected after duplication: ${newNodes.map((n) => n.id()).join(', ')}`);
     }
   
     function deleteSelection() {
       const selectedElements = cy.$(':selected');
       if (selectedElements.length > 0) {
         ur.do('remove', selectedElements);
+        console.log(`Deleted elements: ${selectedElements.map((ele) => ele.id()).join(', ')}`);
+      } else {
+        console.log('No elements selected to delete');
       }
     }
   
     // Save selected nodes and edges as a reusable function
     async function saveSelectionAsFunction() {
       const selectedNodes = cy.nodes(':selected');
+      console.log(`Selected nodes for function: ${selectedNodes.map((n) => n.id()).join(', ')}`);
       if (selectedNodes.length === 0) {
         alert('No nodes selected to save as a function.');
         return;
@@ -451,6 +597,7 @@
         previewContainer: null, // This will be set by Svelte's bind:this
       };
       savedFunctions = [...savedFunctions, func];
+      console.log(`Saved new function: ${functionName}`);
   
       // Wait for the DOM to update
       await tick();
@@ -475,7 +622,7 @@
           {
             selector: 'node',
             style: {
-              'background-color': '#fafad2',
+              'background-color': 'data(color)',
               'label': 'data(label)',
               'text-valign': 'center',
               'color': '#000',
@@ -524,6 +671,7 @@
         userZoomingEnabled: false,
         userPanningEnabled: false,
         boxSelectionEnabled: false,
+        autoungrabify: true, // Disable dragging nodes
       });
   
       // Apply classes for start and accept states
@@ -540,90 +688,197 @@
       previewCy.on('tap', (event) => {
         event.preventDefault();
       });
+    }
   
-      // Implement drag and drop from preview to main canvas
-      func.previewContainer.addEventListener('dragstart', (e) => {
+    // Handle drag start for function previews
+    function handleFunctionDragStart(func) {
+      return (e) => {
+        console.log(`Function drag started: ${func.name}`);
         e.dataTransfer.setData('functionIndex', savedFunctions.indexOf(func));
-      });
-  
-      // Set draggable attribute
-      func.previewContainer.setAttribute('draggable', 'true');
+      };
     }
   
     // Handle drop event on main canvas
     function handleDrop(event) {
       event.preventDefault();
       const functionIndex = event.dataTransfer.getData('functionIndex');
-      if (functionIndex !== null) {
+      console.log(`Function dropped, index: ${functionIndex}`);
+      if (functionIndex !== null && functionIndex !== '') {
         const func = savedFunctions[functionIndex];
         const rect = cy.container().getBoundingClientRect();
-        const x = event.clientX - rect.left;
-        const y = event.clientY - rect.top;
-        const position = cy.renderer().projectIntoViewport(x, y);
   
+        // Use lastMousePosition
+        const x = lastMousePosition.x - rect.left;
+        const y = lastMousePosition.y - rect.top;
+  
+        // Convert screen coordinates to model coordinates
+        const position = convertScreenToModelPosition(x, y);
+  
+        console.log(`Inserting function "${func.name}" at position (${position.x}, ${position.y})`);
         insertFunction(func, position);
       }
     }
   
     function handleDragOver(event) {
       event.preventDefault();
+      lastMousePosition = {
+        x: event.clientX,
+        y: event.clientY,
+      };
+    }
+  
+    function convertScreenToModelPosition(x, y) {
+      const pan = cy.pan();
+      const zoom = cy.zoom();
+  
+      const modelPosition = {
+        x: (x - pan.x) / zoom,
+        y: (y - pan.y) / zoom,
+      };
+  
+      return modelPosition;
     }
   
     // Insert a saved function into the graph at a position
     function insertFunction(func, position) {
-      ur.do('batch', () => {
-        const idMap = {};
-        const existingIds = cy.nodes().map((node) => node.id());
-        const elementsToAdd = func.elements.map((ele) => {
-          const data = { ...ele.data };
-          if (ele.group === 'nodes') {
-            const newId = getNextAvailableStateId();
-            idMap[data.id] = newId.toString();
-            data.id = newId.toString();
-            data.label = newId.toString();
-            ele.data = data;
-            ele.position = {
-              x: ele.position.x + position.x - 50,
-              y: ele.position.y + position.y - 50,
-            };
-          } else if (ele.group === 'edges') {
-            data.source = idMap[data.source];
-            data.target = idMap[data.target];
-            data.id = `e${data.source}-${data.target}-${Math.random()}`;
-            ele.data = data;
-          }
-          return ele;
-        });
+      console.log('Inserting function');
   
-        cy.add(elementsToAdd);
+      const idMap = {};
+  
+      const funcNodes = func.elements.filter((ele) => ele.group === 'nodes');
+  
+      if (funcNodes.length === 0) return;
+  
+      // Calculate centroid of the function nodes
+      const centroid = {
+        x: funcNodes.reduce((sum, node) => sum + node.position.x, 0) / funcNodes.length,
+        y: funcNodes.reduce((sum, node) => sum + node.position.y, 0) / funcNodes.length,
+      };
+  
+      const offset = {
+        x: position.x - centroid.x,
+        y: position.y - centroid.y,
+      };
+  
+      console.log(`Function centroid: (${centroid.x}, ${centroid.y}), offset: (${offset.x}, ${offset.y})`);
+  
+      const elementsToAdd = func.elements.map((ele) => {
+        const data = { ...ele.data };
+        if (ele.group === 'nodes') {
+          const newId = getNextAvailableStateId().toString();
+          idMap[data.id] = newId;
+          data.id = newId;
+          data.label = newId;
+          // Preserve 'start', 'accept', and 'color' properties
+          data.start = ele.data.start;
+          data.accept = ele.data.accept;
+          data.color = ele.data.color;
+          ele.data = data;
+          ele.position = {
+            x: ele.position.x + offset.x,
+            y: ele.position.y + offset.y,
+          };
+          console.log(`Adding node ${data.id} at position (${ele.position.x}, ${ele.position.y})`);
+        } else if (ele.group === 'edges') {
+          data.source = idMap[data.source];
+          data.target = idMap[data.target];
+          data.id = `e${data.source}-${data.target}-${Math.random()}`;
+          ele.data = data;
+          console.log(`Adding edge from ${data.source} to ${data.target}`);
+        }
+        return ele;
       });
+  
+      // Add all elements using ur.do('add', elementsToAdd)
+      ur.do('add', elementsToAdd);
+    }
+  
+    // Function to parse color strings into RGBA fractions
+    function parseColorString(colorStr) {
+      let r = 0.98,
+        g = 0.98,
+        b = 0.82,
+        a = 1; // Default values
+      if (colorStr.startsWith('rgba')) {
+        const rgbaMatch = colorStr.match(/rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d*(?:\.\d+)?)\s*\)/);
+        if (rgbaMatch) {
+          r = parseInt(rgbaMatch[1]) / 255;
+          g = parseInt(rgbaMatch[2]) / 255;
+          b = parseInt(rgbaMatch[3]) / 255;
+          a = parseFloat(rgbaMatch[4]);
+        }
+      } else if (colorStr.startsWith('rgb')) {
+        const rgbMatch = colorStr.match(/rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)/);
+        if (rgbMatch) {
+          r = parseInt(rgbMatch[1]) / 255;
+          g = parseInt(rgbMatch[2]) / 255;
+          b = parseInt(rgbMatch[3]) / 255;
+          a = 1;
+        }
+      } else if (colorStr.startsWith('#')) {
+        if (colorStr.length === 7) {
+          r = parseInt(colorStr.substr(1, 2), 16) / 255;
+          g = parseInt(colorStr.substr(3, 2), 16) / 255;
+          b = parseInt(colorStr.substr(5, 2), 16) / 255;
+          a = 1;
+        }
+      }
+      return { r, g, b, a };
     }
   
     // Function to export the Turing machine definition
     function exportTMDefinition() {
       let output = '';
+      output += '// Save File for STEM\n';
+      output += '// Version 1.00\n\n';
+  
+      // State Format: name x y start accept
+      output += '// State Format: name x y start accept\n';
       output += 'STATES:\n';
+  
+      // Get the height of the Cytoscape container
+      const containerHeight = cy.container().offsetHeight;
+  
       cy.nodes().forEach((node) => {
         const id = node.id();
-        const x = node.position('x').toFixed(2);
-        const y = node.position('y').toFixed(2);
+        const x = node.position('x');
+        const y = node.position('y');
+  
+        // Invert the y-coordinate
+        const invertedY = containerHeight - y;
+  
         const start = node.data('start') ? 'true' : 'false';
         const accept = node.data('accept') ? 'true' : 'false';
-        output += `${id} ${x} ${y} ${start} ${accept}\n`;
+        // Get color data
+        const colorStr = node.data('color') || '#fafad2'; // Default color
+        const rgba = parseColorString(colorStr);
+        output += `\t${id} ${x} ${invertedY} ${start} ${accept} ${rgba.r} ${rgba.g} ${rgba.b} ${rgba.a}\n`;
       });
   
+      // Transition format: fromStateId toStateId readChar writeChar moveDirection
+      // The Character '~' is the catchall character
+      output += '\n// Transition format: fromStateId toStateId readCHar writeChar moveDirection\n';
+      output += "// The Character '~' is the catchall character\n";
       output += 'TRANSITION:\n';
       cy.edges().forEach((edge) => {
         const source = edge.source().id();
         const target = edge.target().id();
-        const label = edge.data('label');
-        // Assuming the label is in the format 'readChar→writeChar, moveDirection'
+        let label = edge.data('label');
+        // Replace '→' with '->' if necessary
+        label = label.replace('→', '->');
+        // Assuming the label is in the format 'readChar->writeChar, moveDirection'
         const [readWrite, moveDirection] = label.split(',').map((s) => s.trim());
-        const [readChar, writeChar] = readWrite.split('→').map((s) => s.trim());
-        output += `${source} ${target} ${readChar} ${writeChar} ${moveDirection}\n`;
+        const [readChar, writeChar] = readWrite.split('->').map((s) => s.trim());
+        output += `\t${source} ${target} ${readChar} ${writeChar} ${moveDirection}\n`;
       });
   
-      // For simplicity, we won't include the TAPE and Start Triangle Position sections
+      // Tape format: tapeChar(0) tapeChar(1) ... tapeChar(n)
+      output += '\n// Tape format: tapeChar(0) tapeChar(1) ... tapeChar(n)\n';
+      output += 'TAPE:\n';
+      output += `\t${tapeHeadPosition}\n`; // Include the number before the tape content
+      output += `\t${tape.join('')}\n`;
+      output += `Start Triangle Position:${tapeHeadPosition}\n`;
+  
       downloadTextFile('turing_machine_definition.txt', output);
     }
   
@@ -644,29 +899,43 @@
     function startAddTransition() {
       addTransitionMode = true;
       transitionSourceNode = null;
-      alert('Add Transition Mode: Click on the source node, then the target node.');
+      console.log('Add Transition Mode: Click on the source node, then the target node.');
     }
   
     function handleAddTransition(node) {
       if (!transitionSourceNode) {
         transitionSourceNode = node;
+        console.log(`Transition source node selected: ${node.id()}`);
       } else {
         const sourceNode = transitionSourceNode;
         const targetNode = node;
-        const label = prompt('Enter transition label (format: readChar→writeChar, moveDirection)');
-        if (label !== null) {
-          ur.do('add', {
-            group: 'edges',
-            data: {
-              id: `e${sourceNode.id()}-${targetNode.id()}-${Math.random()}`,
-              source: sourceNode.id(),
-              target: targetNode.id(),
-              label: label,
-            },
-          });
-        }
-        addTransitionMode = false;
         transitionSourceNode = null;
+        addTransitionMode = false;
+  
+        console.log(`Transition target node selected: ${node.id()}`);
+  
+        // Show modal to enter transition label
+        showTransitionModal = true;
+  
+        transitionCallback = (label) => {
+          if (label !== null && label !== '') {
+            ur.do('add', {
+              group: 'edges',
+              data: {
+                id: `e${sourceNode.id()}-${targetNode.id()}-${Math.random()}`,
+                source: sourceNode.id(),
+                target: targetNode.id(),
+                label: label,
+              },
+            });
+            console.log(`Added transition from ${sourceNode.id()} to ${targetNode.id()} with label "${label}"`);
+          } else {
+            console.log('Transition label input cancelled or empty');
+          }
+          showTransitionModal = false;
+          transitionLabel = '';
+          transitionCallback = null;
+        };
       }
     }
   
@@ -695,7 +964,15 @@
       const cyContainer = document.getElementById('cy');
       cyContainer.addEventListener('dragover', handleDragOver);
       cyContainer.addEventListener('drop', handleDrop);
+      console.log('Cytoscape initialized and event listeners added');
     });
+  
+    // Update visualization function (if applicable)
+    function updateVisualization() {
+      // Implement this function if you have visualization updates
+    }
+  
+    // Tape simulation functions (simulateStep, etc.) if needed
   </script>
   
   <div>
@@ -726,10 +1003,32 @@
         use:clickOutside
       >
         <ul>
-          <li on:click={editTransition}>Edit Transition</li>
+          <li on:click={() => editEdgeLabel(contextEdge)}>Edit Transition</li>
         </ul>
       </div>
     {/if}
+  {/if}
+  
+  {#if showTransitionModal}
+    <div class="modal-overlay">
+      <div class="modal">
+        <h3>Enter Transition Label</h3>
+        <input type="text" bind:value={transitionLabel} placeholder="readChar->writeChar, moveDirection" />
+        <button on:click={() => transitionCallback(transitionLabel)}>OK</button>
+        <button on:click={() => { showTransitionModal = false; transitionLabel = ''; transitionCallback = null; }}>Cancel</button>
+      </div>
+    </div>
+  {/if}
+  
+  {#if showEdgeLabelModal}
+    <div class="modal-overlay">
+      <div class="modal">
+        <h3>Edit Transition Label</h3>
+        <input type="text" bind:value={edgeLabel} />
+        <button on:click={saveEdgeLabel}>Save</button>
+        <button on:click={cancelEdgeLabelEdit}>Cancel</button>
+      </div>
+    </div>
   {/if}
   
   <div>
@@ -738,12 +1037,17 @@
       <ul>
         {#each savedFunctions as func}
           <li>
-            {func.name}
             <div
-              class="function-preview"
-              bind:this={func.previewContainer}
-              on:dragstart
-            ></div>
+              class="function-preview-container"
+              draggable="true"
+              on:dragstart={handleFunctionDragStart(func)}
+            >
+              {func.name}
+              <div
+                class="function-preview"
+                bind:this={func.previewContainer}
+              ></div>
+            </div>
           </li>
         {/each}
       </ul>
@@ -775,34 +1079,52 @@
       background-color: #eee;
     }
   
-    /* Edgehandles styles */
-    .eh-handle {
-      background-color: #666;
-      width: 12px;
-      height: 12px;
-    }
-  
-    .eh-hover {
-      background-color: #aaa;
-    }
-  
-    .eh-source {
-      border-color: #333;
-    }
-  
-    .eh-target {
-      border-color: #333;
+    .function-preview-container {
+      display: inline-block;
+      cursor: move;
+      margin: 10px;
+      user-select: none;
     }
   
     .function-preview {
       width: 100px;
       height: 100px;
       border: 1px solid #ccc;
-      display: inline-block;
-      margin-left: 10px;
+      pointer-events: none; /* Disable interactions */
     }
   
-    .function-preview[draggable="true"] {
-      cursor: move;
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.5);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 2000;
+    }
+  
+    .modal {
+      background: white;
+      padding: 20px;
+      border-radius: 4px;
+      min-width: 300px;
+    }
+  
+    .modal h3 {
+      margin-top: 0;
+    }
+  
+    .modal input {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 10px;
+    }
+  
+    .modal button {
+      padding: 8px 12px;
+      margin-right: 10px;
     }
   </style>
