@@ -13,7 +13,9 @@
     let transitionSourceNode = null;
   
     let showTransitionModal = false;
-    let transitionLabel = '';
+    let transitionReadChar = '';
+    let transitionWriteChar = '';
+    let transitionMoveDirection = 'RIGHT'; // Default direction
     let transitionCallback = null;
   
     let showEdgeLabelModal = false;
@@ -144,14 +146,30 @@
       });
   
       tmTransitions.forEach((transition) => {
-        elements.push({
-          data: {
-            id: `e${transition.from}-${transition.to}-${Math.random()}`,
-            source: transition.from,
-            target: transition.to,
-            label: `${transition.readChar}->${transition.writeChar}, ${transition.moveDirection}`,
-          },
-        });
+        const transitionLabel = `${transition.readChar};${transition.writeChar};${transition.moveDirection}`;
+  
+        // Check if an edge between from and to already exists
+        let edge = elements.find(
+          (ele) =>
+            ele.group === 'edges' &&
+            ele.data.source === transition.from &&
+            ele.data.target === transition.to
+        );
+  
+        if (edge) {
+          // Edge exists, append the transition label
+          edge.data.label += `\n${transitionLabel}`;
+        } else {
+          // Edge does not exist, create a new one
+          elements.push({
+            data: {
+              id: `e${transition.from}-${transition.to}-${Math.random()}`,
+              source: transition.from,
+              target: transition.to,
+              label: transitionLabel,
+            },
+          });
+        }
       });
   
       // Initialize Cytoscape
@@ -359,9 +377,9 @@
       });
   
       // Clean up event listeners when the component is destroyed
-      onDestroy(() => {
-        document.removeEventListener('keydown', handleKeyDown);
-      });
+    //   onDestroy(() => {
+    //     document.removeEventListener('keydown', handleKeyDown);
+    //   });
     }
   
     function addNodeAtPosition(x, y) {
@@ -845,7 +863,7 @@
         const y = node.position('y');
   
         // Invert the y-coordinate
-        const invertedY = containerHeight - y;
+        const invertedY = Math.abs(y);
   
         const start = node.data('start') ? 'true' : 'false';
         const accept = node.data('accept') ? 'true' : 'false';
@@ -857,19 +875,18 @@
   
       // Transition format: fromStateId toStateId readChar writeChar moveDirection
       // The Character '~' is the catchall character
-      output += '\n// Transition format: fromStateId toStateId readCHar writeChar moveDirection\n';
+      output += '\n// Transition format: fromStateId toStateId readChar writeChar moveDirection\n';
       output += "// The Character '~' is the catchall character\n";
       output += 'TRANSITION:\n';
+  
       cy.edges().forEach((edge) => {
         const source = edge.source().id();
         const target = edge.target().id();
-        let label = edge.data('label');
-        // Replace '→' with '->' if necessary
-        label = label.replace('→', '->');
-        // Assuming the label is in the format 'readChar->writeChar, moveDirection'
-        const [readWrite, moveDirection] = label.split(',').map((s) => s.trim());
-        const [readChar, writeChar] = readWrite.split('->').map((s) => s.trim());
-        output += `\t${source} ${target} ${readChar} ${writeChar} ${moveDirection}\n`;
+        const labels = edge.data('label').split('\n');
+        labels.forEach((label) => {
+          const [readChar, writeChar, moveDirection] = label.split(';').map((s) => s.trim());
+          output += `\t${source} ${target} ${readChar} ${writeChar} ${moveDirection}\n`;
+        });
       });
   
       // Tape format: tapeChar(0) tapeChar(1) ... tapeChar(n)
@@ -914,28 +931,56 @@
   
         console.log(`Transition target node selected: ${node.id()}`);
   
-        // Show modal to enter transition label
+        // Show modal to enter transition details
         showTransitionModal = true;
   
-        transitionCallback = (label) => {
-          if (label !== null && label !== '') {
-            ur.do('add', {
-              group: 'edges',
-              data: {
-                id: `e${sourceNode.id()}-${targetNode.id()}-${Math.random()}`,
-                source: sourceNode.id(),
-                target: targetNode.id(),
-                label: label,
-              },
-            });
-            console.log(`Added transition from ${sourceNode.id()} to ${targetNode.id()} with label "${label}"`);
+        transitionCallback = (readChar, writeChar, moveDirection) => {
+          if (readChar && writeChar && moveDirection) {
+            addOrUpdateEdge(sourceNode.id(), targetNode.id(), readChar, writeChar, moveDirection);
           } else {
-            console.log('Transition label input cancelled or empty');
+            console.log('Transition input cancelled or incomplete');
           }
           showTransitionModal = false;
-          transitionLabel = '';
+          transitionReadChar = '';
+          transitionWriteChar = '';
+          transitionMoveDirection = 'RIGHT';
           transitionCallback = null;
         };
+      }
+    }
+  
+    function addOrUpdateEdge(sourceId, targetId, readChar, writeChar, moveDirection) {
+      // Check if an edge already exists between source and target
+      let edge = cy
+        .edges()
+        .filter((edge) => edge.source().id() === sourceId && edge.target().id() === targetId)
+        .first();
+  
+      const transitionLabel = `${readChar};${writeChar};${moveDirection}`;
+  
+      if (edge && edge.length > 0) {
+        // Edge exists, update the label
+        let existingLabel = edge.data('label');
+        const labels = existingLabel ? existingLabel.split('\n') : [];
+        labels.push(transitionLabel);
+        const newLabel = labels.join('\n');
+        ur.do('changeData', {
+          ele: edge,
+          data: { label: newLabel },
+        });
+        console.log(`Updated edge between ${sourceId} and ${targetId} with new transition`);
+      } else {
+        // Edge does not exist, create a new one
+        ur.do('add', {
+          group: 'edges',
+          data: {
+            id: `e${sourceId}-${targetId}-${Math.random()}`,
+            source: sourceId,
+            target: targetId,
+            label: transitionLabel,
+          },
+        });
+        console.log(`Added new edge from ${sourceId} to ${targetId} with transition`);
       }
     }
   
@@ -1012,10 +1057,41 @@
   {#if showTransitionModal}
     <div class="modal-overlay">
       <div class="modal">
-        <h3>Enter Transition Label</h3>
-        <input type="text" bind:value={transitionLabel} placeholder="readChar->writeChar, moveDirection" />
-        <button on:click={() => transitionCallback(transitionLabel)}>OK</button>
-        <button on:click={() => { showTransitionModal = false; transitionLabel = ''; transitionCallback = null; }}>Cancel</button>
+        <h3>Enter Transition Details</h3>
+        <label>
+          Read Character:
+          <input type="text" bind:value={transitionReadChar} />
+        </label>
+        <label>
+          Write Character:
+          <input type="text" bind:value={transitionWriteChar} />
+        </label>
+        <label>
+          Move Direction:
+          <select bind:value={transitionMoveDirection}>
+            <option value="LEFT">Left</option>
+            <option value="RIGHT">Right</option>
+            <option value="STAY">Stay</option>
+          </select>
+        </label>
+        <button
+          on:click={() =>
+            transitionCallback(transitionReadChar, transitionWriteChar, transitionMoveDirection)
+          }
+        >
+          OK
+        </button>
+        <button
+          on:click={() => {
+            showTransitionModal = false;
+            transitionReadChar = '';
+            transitionWriteChar = '';
+            transitionMoveDirection = 'RIGHT';
+            transitionCallback = null;
+          }}
+        >
+          Cancel
+        </button>
       </div>
     </div>
   {/if}
@@ -1024,7 +1100,7 @@
     <div class="modal-overlay">
       <div class="modal">
         <h3>Edit Transition Label</h3>
-        <input type="text" bind:value={edgeLabel} />
+        <textarea bind:value={edgeLabel} rows="5" style="width: 100%;"></textarea>
         <button on:click={saveEdgeLabel}>Save</button>
         <button on:click={cancelEdgeLabelEdit}>Cancel</button>
       </div>
@@ -1117,7 +1193,9 @@
       margin-top: 0;
     }
   
-    .modal input {
+    .modal input,
+    .modal textarea,
+    .modal select {
       width: 100%;
       padding: 8px;
       margin-bottom: 10px;
