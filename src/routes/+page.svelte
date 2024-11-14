@@ -1,5 +1,5 @@
 <script>
-  import { onMount, onDestroy, tick } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import cytoscape from 'cytoscape';
   import cytoscapeCoseBilkent from 'cytoscape-cose-bilkent';
   import undoRedo from 'cytoscape-undo-redo';
@@ -62,6 +62,130 @@
     }
   }
 
+  function handleImageUpload(event) {
+    const file = event.target.files[0];
+    if (file) {
+      const img = new Image();
+      const reader = new FileReader();
+
+      reader.onload = (e) => {
+        img.src = e.target.result;
+        img.onload = () => {
+          processImage(img);
+        };
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
+  function processImage(img) {
+    // Get existing nodes
+    const nodes = cy.nodes();
+    if (nodes.length === 0) {
+      alert('No nodes available to rearrange. Please upload a Turing machine file first.');
+      return;
+    }
+
+    // Use an off-screen canvas to get image data
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const imageData = ctx.getImageData(0, 0, img.width, img.height);
+    const data = imageData.data;
+
+    // Collect non-transparent pixels
+    const pixels = [];
+    for (let y = 0; y < img.height; y++) {
+      for (let x = 0; x < img.width; x++) {
+        const index = (y * img.width + x) * 4;
+        const r = data[index];
+        const g = data[index + 1];
+        const b = data[index + 2];
+        const a = data[index + 3];
+
+        // Skip transparent pixels
+        if (a === 0) continue;
+
+        const color = `rgba(${r}, ${g}, ${b}, ${a / 255})`;
+        pixels.push({ x, y, color });
+      }
+    }
+
+    if (pixels.length === 0) {
+      alert('The image has no visible pixels to process.');
+      return;
+    }
+
+    // Determine scaling to fit the image into the current canvas size
+    const gridSize=100; // Match the grid size
+    const cyContainer = cy.container();
+    const containerWidth = cyContainer.clientWidth;
+    const containerHeight = cyContainer.clientHeight;
+
+    const imageAspectRatio = img.width / img.height;
+    const containerAspectRatio = containerWidth / containerHeight;
+
+    let scale;
+    if (imageAspectRatio > containerAspectRatio) {
+      // Image is wider than container
+      scale = (containerWidth - gridSize * 2) / img.width;
+    } else {
+      // Image is taller than container
+      scale = (containerHeight - gridSize * 2) / img.height;
+    }
+
+    // Center the image in the container
+    const offsetX = (containerWidth - img.width * scale) / 2;
+    const offsetY = (containerHeight - img.height * scale) / 2;
+
+    // Map existing nodes to pixels
+    const numNodes = nodes.length;
+    const numPixels = pixels.length;
+
+    // Shuffle nodes and pixels to get a random distribution
+    const shuffledNodes = nodes.sort(() => Math.random() - 0.5);
+    const shuffledPixels = pixels.sort(() => Math.random() - 0.5);
+
+    // If there are more pixels than nodes, only use as many pixels as nodes
+    // If there are more nodes than pixels, some nodes will not be assigned
+    const assignments = [];
+
+    for (let i = 0; i < Math.min(numNodes, numPixels); i++) {
+      assignments.push({ node: shuffledNodes[i], pixel: shuffledPixels[i] });
+    }
+
+    // If there are more nodes than pixels, assign remaining nodes to random positions with default color
+    for (let i = Math.min(numNodes, numPixels); i < numNodes; i++) {
+      assignments.push({
+        node: shuffledNodes[i],
+        pixel: null, // No pixel to assign
+      });
+    }
+
+    // Update node positions and colors
+    assignments.forEach(({ node, pixel }) => {
+      if (pixel) {
+        const x = Math.round((pixel.x * scale + offsetX) / gridSize) * gridSize;
+        const y = Math.round((pixel.y * scale + offsetY) / gridSize) * gridSize;
+        node.position({ x, y });
+        node.data('color', pixel.color);
+      } else {
+        // Assign default color and random position
+        const x = Math.round(Math.random() * containerWidth / gridSize) * gridSize;
+        const y = Math.round(Math.random() * containerHeight / gridSize) * gridSize;
+        node.position({ x, y });
+        node.data('color', '#fafad2'); // Default color
+      }
+    });
+
+    // Refresh the layout
+    cy.batch(() => {
+      nodes.emit('position');
+    });
+  }
+
   function parseAndRenderTMDefinition(tmDefinition) {
     // Initialize arrays to store parsed states and transitions
     const tmStates = [];
@@ -111,15 +235,20 @@
         });
       } else if (currentSection === 'TRANSITION') {
         // Parse transition line
-        const tokens = line.split(/\s+/);
-        const [fromStateId, toStateId, readChar, writeChar, moveDirection] = tokens;
+        const match = line.match(/^(\d+)\s(\d+)\s(.)\s(.)\s(\S+)$/);
+    
+    if (match) {
+        const [_, fromStateId, toStateId, readChar, writeChar, moveDirection] = match;
         tmTransitions.push({
-          from: fromStateId,
-          to: toStateId,
-          readChar: readChar,
-          writeChar: writeChar,
-          moveDirection: moveDirection,
+            from: fromStateId,
+            to: toStateId,
+            readChar: readChar,
+            writeChar: writeChar,
+            moveDirection: moveDirection,
         });
+    } else {
+        console.error(`Invalid transition line: ${line}`);
+    }
       } else if (currentSection === 'TAPE') {
         if (!line.startsWith('Start Triangle Position:') && !line.startsWith('//') && line !== '') {
           if (isNaN(parseInt(line))) {
@@ -324,7 +453,21 @@
         }
       }
     );
-
+    ur.action(
+  'changePosition',
+  function (args) {
+    const ele = args.ele;
+    const newPosition = args.position;
+    const oldPosition = { ...ele.position() };
+    ele.position(newPosition);
+    return { ele: ele, position: oldPosition };
+  },
+  function (args) {
+    const ele = args.ele;
+    const position = args.position;
+    ele.position(position);
+  }
+);
     // Set stateIdCounter to the maximum numeric node ID plus one
     const numericIds = cy.nodes().map((node) => parseInt(node.id())).filter((id) => !isNaN(id));
     if (numericIds.length > 0) {
@@ -379,7 +522,7 @@
     // Snap nodes to grid on drag end
     cy.on('free', 'node', (event) => {
       const node = event.target;
-      const gridSize = 20; // Grid size matches the background grid
+      const gridSize=100; // Grid size matches the background grid
       const pos = node.position();
       const snappedPosition = {
         x: Math.round(pos.x / gridSize) * gridSize,
@@ -387,15 +530,10 @@
       };
       node.position(snappedPosition);
     });
-
-    // Clean up event listeners when the component is destroyed
-    // onDestroy(() => {
-    //   document.removeEventListener('keydown', handleKeyDown);
-    // });
   }
 
   function addNodeAtPosition(x, y) {
-    const gridSize = 20; // Grid size matches the background grid
+    const gridSize=100; // Grid size matches the background grid
     const newId = getNextAvailableStateId().toString();
     const snappedX = Math.round(x / gridSize) * gridSize;
     const snappedY = Math.round(y / gridSize) * gridSize;
@@ -557,7 +695,7 @@
       data.start = node.data('start');
       data.accept = node.data('accept');
       data.color = node.data('color'); // Preserve color
-      const gridSize = 20; // Grid size matches the background grid
+      const gridSize=100; // Grid size matches the background grid
       const position = {
         x: Math.round((node.position('x') + 50) / gridSize) * gridSize,
         y: Math.round((node.position('y') + 50) / gridSize) * gridSize, // Place diagonally below the original
@@ -796,7 +934,7 @@
 
     console.log(`Function centroid: (${centroid.x}, ${centroid.y}), offset: (${offset.x}, ${offset.y})`);
 
-    const gridSize = 20; // Grid size matches the background grid
+    const gridSize=100; // Grid size matches the background grid
 
     const elementsToAdd = func.elements.map((ele) => {
       const data = { ...ele.data };
@@ -898,14 +1036,21 @@
     output += 'TRANSITION:\n';
 
     cy.edges().forEach((edge) => {
-      const source = edge.source().id();
-      const target = edge.target().id();
-      const labels = edge.data('label').split('\n');
-      labels.forEach((label) => {
-        const [readChar, writeChar, moveDirection] = label.split(';').map((s) => s.trim());
-        output += `\t${source} ${target} ${readChar} ${writeChar} ${moveDirection}\n`;
-      });
+    const source = edge.source().id();
+    const target = edge.target().id();
+    const labels = edge.data('label').split('\n');
+
+    labels.forEach((label) => {
+        // Split using semicolon and preserve spaces correctly
+        const [readChar, writeChar, moveDirection] = label.split(';').map((s) => s === ' ' ? ' ' : s.trim());
+        
+        // Ensure readChar and writeChar output spaces correctly
+        const formattedReadChar = readChar === ' ' ? " " : readChar; // Explicitly show a space
+        const formattedWriteChar = writeChar === ' ' ? " " : writeChar;
+
+        output += `\t${source} ${target} ${formattedReadChar} ${formattedWriteChar} ${moveDirection}\n`;
     });
+});
 
     // Tape format: tapeChar(0) tapeChar(1) ... tapeChar(n)
     output += '\n// Tape format: tapeChar(0) tapeChar(1) ... tapeChar(n)\n';
@@ -966,7 +1111,28 @@
       };
     }
   }
-
+  function snapToGrid() {
+  const gridSize=100; // Match the grid size
+  const snapGridSize = gridSize / 5; // Snap to the nearest 1/5th of gridSize
+  let nodesToSnap = cy.nodes(':selected');
+  if (nodesToSnap.length === 0 && contextNode) {
+    nodesToSnap = cy.collection([contextNode]);
+  }
+  if (nodesToSnap.length === 0) {
+    console.log('No nodes selected to snap to grid');
+    return;
+  }
+  ur.do('batch', () => {
+    nodesToSnap.forEach((node) => {
+      const newPosition = {
+        x: Math.round(node.position('x') / snapGridSize) * snapGridSize,
+        y: Math.round(node.position('y') / snapGridSize) * snapGridSize,
+      };
+      ur.do('changePosition', { ele: node, position: newPosition });
+    });
+  });
+  closeContextMenu();
+}
   function addOrUpdateEdge(sourceId, targetId, readChar, writeChar, moveDirection) {
     // Check if an edge already exists between source and target
     let edge = cy
@@ -1039,12 +1205,17 @@
 </script>
 
 <div>
-  <input type="file" on:change={handleFileUpload} />
+  <input type="file" on:change={handleFileUpload} accept=".txt" />
   <button on:click={exportTMDefinition}>Export Turing Machine</button>
   <button on:click={startAddTransition}>Add Transition</button>
 </div>
 
-<div id="cy" style="width: 100%; height: 70vh; border: 1px solid #ccc;"></div>
+<div>
+  <input type="file" on:change={handleImageUpload} accept="image/*" />
+  <label>Upload Image to Rearrange Nodes</label>
+</div>
+
+<div id="cy"></div>
 
 {#if contextMenuVisible}
   {#if contextMenuType === 'node'}
@@ -1057,6 +1228,8 @@
         <li on:click={toggleStartState}>Toggle Start State</li>
         <li on:click={toggleAcceptState}>Toggle Accept State</li>
         <li on:click={setNodeColor}>Set Color</li>
+        <li on:click={snapToGrid}>Snap to Grid</li> <!-- Add this line -->
+
       </ul>
     </div>
   {:else if contextMenuType === 'edge'}
